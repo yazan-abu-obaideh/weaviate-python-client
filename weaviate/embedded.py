@@ -10,11 +10,12 @@ import time
 import urllib.request
 import warnings
 import zipfile
-from abc import abstractmethod
+from abc import abstractmethod, ABCMeta
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, Optional, Tuple
 
+import docker
 import httpx
 import validators
 
@@ -42,6 +43,7 @@ class EmbeddedOptions:
     hostname: str = "127.0.0.1"
     additional_env_vars: Optional[Dict[str, str]] = None
     grpc_port: int = DEFAULT_GRPC_PORT
+    use_docker: bool = False
 
 
 def get_random_port() -> int:
@@ -53,11 +55,65 @@ def get_random_port() -> int:
 
 
 class _EmbeddedBase:
-    def __init__(self, options: EmbeddedOptions) -> None:
+    def __init__(self, options: EmbeddedOptions):
         self.options = options
         self.grpc_port: int = options.grpc_port
         self.process: Optional[subprocess.Popen[bytes]] = None
         self.ensure_paths_exist()
+
+        pass
+
+    def ensure_paths_exist(self) -> None:
+        Path(self.options.persistence_data_path).mkdir(parents=True, exist_ok=True)
+
+    def _prepare_env(self):
+        my_env = os.environ.copy()
+        my_env.setdefault("AUTHENTICATION_ANONYMOUS_ACCESS_ENABLED", "true")
+        my_env.setdefault("QUERY_DEFAULTS_LIMIT", "20")
+        my_env.setdefault("PERSISTENCE_DATA_PATH", self.options.persistence_data_path)
+        my_env.setdefault("PROFILING_PORT", str(get_random_port()))
+        # Limitation with weaviate server requires setting
+        # data_bind_port to gossip_bind_port + 1
+        gossip_bind_port = get_random_port()
+        data_bind_port = gossip_bind_port + 1
+        my_env.setdefault("CLUSTER_GOSSIP_BIND_PORT", str(gossip_bind_port))
+        my_env.setdefault("CLUSTER_DATA_BIND_PORT", str(data_bind_port))
+        my_env.setdefault("GRPC_PORT", str(self.grpc_port))
+        my_env.setdefault("RAFT_BOOTSTRAP_EXPECT", str(1))
+        my_env.setdefault("CLUSTER_IN_LOCALHOST", str(True))
+        # Each call to `get_random_port()` will likely result in
+        # a port 1 higher than the last time it was called. With
+        # this, we end up with raft_port == gossip_bind_port + 1,
+        # which is the same as data_bind_port. This kind of
+        # configuration leads to failed cross cluster communication.
+        # Although the current version of embedded does not support
+        # multi-node instances, the backup process communication
+        # passes through the internal cluster server, and will fail.
+        #
+        # So we here we ensure that raft_port never collides with
+        # data_bind_port.
+        raft_port = data_bind_port + 1
+        raft_internal_rpc_port = raft_port + 1
+        my_env.setdefault("RAFT_PORT", str(raft_port))
+        my_env.setdefault("RAFT_INTERNAL_RPC_PORT", str(raft_internal_rpc_port))
+        my_env.setdefault(
+            "ENABLE_MODULES",
+            "text2vec-openai,text2vec-cohere,text2vec-huggingface,ref2vec-centroid,generative-openai,qna-openai,"
+            "reranker-cohere",
+        )
+        # have a deterministic hostname in case of changes in the network name.
+        # This allows to run multiple parallel instances
+        cluster_hostname = f"Embedded_at_{self.options.port}"
+        my_env.setdefault("CLUSTER_HOSTNAME", cluster_hostname)
+        my_env.setdefault("RAFT_JOIN", f"{cluster_hostname}:{raft_port}")
+        if self.options.additional_env_vars is not None:
+            my_env.update(self.options.additional_env_vars)
+        return my_env
+
+
+class _EmbeddedBinaryBase(_EmbeddedBase):
+    def __init__(self, options: EmbeddedOptions) -> None:
+        super().__init__(options)
         self.check_supported_platform()
         self._parsed_weaviate_version = ""
         # regular expression to detect a version number: v[one digit].[1-2 digits].[1-2 digits]
@@ -126,8 +182,8 @@ class _EmbeddedBase:
         self.stop()
 
     def ensure_paths_exist(self) -> None:
+        super().ensure_paths_exist()
         Path(self.options.binary_path).mkdir(parents=True, exist_ok=True)
-        Path(self.options.persistence_data_path).mkdir(parents=True, exist_ok=True)
 
     def ensure_weaviate_binary_exists(self) -> None:
         self._weaviate_binary_path = Path(
@@ -202,52 +258,7 @@ class _EmbeddedBase:
 
     def start(self) -> None:
         self.ensure_weaviate_binary_exists()
-        my_env = os.environ.copy()
-
-        my_env.setdefault("AUTHENTICATION_ANONYMOUS_ACCESS_ENABLED", "true")
-        my_env.setdefault("QUERY_DEFAULTS_LIMIT", "20")
-        my_env.setdefault("PERSISTENCE_DATA_PATH", self.options.persistence_data_path)
-        my_env.setdefault("PROFILING_PORT", str(get_random_port()))
-        # Limitation with weaviate server requires setting
-        # data_bind_port to gossip_bind_port + 1
-        gossip_bind_port = get_random_port()
-        data_bind_port = gossip_bind_port + 1
-        my_env.setdefault("CLUSTER_GOSSIP_BIND_PORT", str(gossip_bind_port))
-        my_env.setdefault("CLUSTER_DATA_BIND_PORT", str(data_bind_port))
-        my_env.setdefault("GRPC_PORT", str(self.grpc_port))
-        my_env.setdefault("RAFT_BOOTSTRAP_EXPECT", str(1))
-        my_env.setdefault("CLUSTER_IN_LOCALHOST", str(True))
-
-        # Each call to `get_random_port()` will likely result in
-        # a port 1 higher than the last time it was called. With
-        # this, we end up with raft_port == gossip_bind_port + 1,
-        # which is the same as data_bind_port. This kind of
-        # configuration leads to failed cross cluster communication.
-        # Although the current version of embedded does not support
-        # multi-node instances, the backup process communication
-        # passes through the internal cluster server, and will fail.
-        #
-        # So we here we ensure that raft_port never collides with
-        # data_bind_port.
-        raft_port = data_bind_port + 1
-        raft_internal_rpc_port = raft_port + 1
-        my_env.setdefault("RAFT_PORT", str(raft_port))
-        my_env.setdefault("RAFT_INTERNAL_RPC_PORT", str(raft_internal_rpc_port))
-
-        my_env.setdefault(
-            "ENABLE_MODULES",
-            "text2vec-openai,text2vec-cohere,text2vec-huggingface,ref2vec-centroid,generative-openai,qna-openai,"
-            "reranker-cohere",
-        )
-
-        # have a deterministic hostname in case of changes in the network name.
-        # This allows to run multiple parallel instances
-        cluster_hostname = f"Embedded_at_{self.options.port}"
-        my_env.setdefault("CLUSTER_HOSTNAME", cluster_hostname)
-        my_env.setdefault("RAFT_JOIN", f"{cluster_hostname}:{raft_port}")
-
-        if self.options.additional_env_vars is not None:
-            my_env.update(self.options.additional_env_vars)
+        my_env = self._prepare_env()
 
         # filter warning about running processes.
         with warnings.catch_warnings():
@@ -275,7 +286,7 @@ class _EmbeddedBase:
         raise NotImplementedError()
 
 
-class EmbeddedV3(_EmbeddedBase):
+class EmbeddedV3(_EmbeddedBinaryBase):
     def is_listening(self) -> bool:
         s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         try:
@@ -296,7 +307,7 @@ class EmbeddedV3(_EmbeddedBase):
 EmbeddedDB = EmbeddedV3  # needed for BC from v3 -> v4
 
 
-class EmbeddedV4(_EmbeddedBase):
+class EmbeddedV4(_EmbeddedBinaryBase):
     def is_listening(self) -> bool:
         up = self.__is_listening()
         return up[0] and up[1]
@@ -335,3 +346,35 @@ class EmbeddedV4(_EmbeddedBase):
                 "look for another free port for the gRPC connection to your embedded instance"
             )
         super().start()
+
+CONTAINER_NAME = "python-embedded-weaviate"
+
+class _EmbeddedDockerBase(_EmbeddedBase, metaclass=ABCMeta):
+    def __init__(self, options: EmbeddedOptions):
+        super().__init__(options)
+        self.docker_client = docker.from_env()
+
+    def start(self) -> None:
+        self.delete_embedded_if_exists()
+        run_env = self._prepare_env()
+        self.docker_client.containers.run(
+            name=CONTAINER_NAME,
+            image="cr.weaviate.io/semitechnologies/weaviate:1.32.1",
+            environment=run_env,
+            ports={
+                "8080": "8080"
+            },
+            detach=True
+        )
+
+    def delete_embedded_if_exists(self):
+        all_containers = self.docker_client.containers.list()
+        for container in all_containers:
+            if container.name == CONTAINER_NAME:
+                container.stop()
+                container.remove()
+
+    def stop(self) -> None:
+        self.delete_embedded_if_exists()
+
+
